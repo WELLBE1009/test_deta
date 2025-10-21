@@ -1,24 +1,730 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ja">
 <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="./vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Sales Comparison Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
-<script type="importmap">
-{
-  "imports": {
-    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
-    "react/": "https://aistudiocdn.com/react@^19.2.0/",
-    "react": "https://aistudiocdn.com/react@^19.2.0"
-  }
-}
-</script>
+    <style>
+        /* Custom styles for loader animation */
+        .loader {
+            border-top-color: #3b82f6; /* Tailwind's blue-500 */
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
 </head>
 <body class="bg-gradient-to-br from-slate-50 to-slate-100">
     <div id="root"></div>
-    <script type="module" src="./index.tsx"></script>
+    <div id="alert-container" class="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 flex flex-col items-center gap-2"></div>
+
+    <script type="module">
+        // --- CONSTANTS ---
+        const ACCESS_PASSWORD = "3737";
+        const SPREADSHEET_ID = "1mhzjuXpC7YYus9qvzlLahRwlz3QaQgjVQpYNRaugOU4";
+        const SHEET_NAMES = ["栄", "今池", "福岡"];
+        const COMPARISON_KEYS = ['売上日計', 'サウナ', '宿泊売上計', 'マッサージ', 'グリル', '物販'];
+        const SUMMABLE_KEYS = [
+            '売上日計', 'サウナ', '宿泊売上計', 'マッサージ', 'グリル', '物販',
+            '人数(S)', '人数(C)', '人数(M)', '件数(G)'
+        ];
+        const SUB_ITEM_MAP = {
+            'サウナ': [['人数', '人数(S)']],
+            '宿泊売上計': [['人数', '人数(C)']],
+            'マッサージ': [['人数', '人数(M)']],
+            'グリル': [['件数', '件数(G)']],
+        };
+
+        // --- STATE MANAGEMENT ---
+        const state = {
+            isAuthenticated: false,
+            loading: false,
+            error: null,
+            allData: {},
+            availableDates: [],
+            selectedDate: '',
+            sortOrder: 'newest',
+            periodSummary: null,
+            comparisonPeriodSummary: null,
+            periodStartDate: '2025-10-01',
+            periodEndDate: '2025-10-15',
+            isSummarizing: false,
+        };
+
+        const rootEl = document.getElementById('root');
+        const alertContainerEl = document.getElementById('alert-container');
+
+        // --- UTILITY & SERVICE FUNCTIONS ---
+
+        function sanitizeKey(str) {
+            if (!str) return '';
+            return str
+                .replace(/[Ａ-Ｚａ-ｚ０-９]/g, (s) => String.fromCharCode(s.charCodeAt(0) - 0xFEE0))
+                .replace(/（/g, '(')
+                .replace(/）/g, ')');
+        }
+
+        async function fetchSheetData(sheetName) {
+            const query = 'select *';
+            const url = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(sheetName)}&tq=${encodeURIComponent(query)}`;
+            
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status} for sheet: ${sheetName}`);
+            }
+            
+            const text = await response.text();
+            const jsonString = text.substring(47, text.length - 2);
+            const data = JSON.parse(jsonString);
+
+            if (data.status === 'error') {
+                throw new Error(data.errors.map((e) => e.detailed_message).join(', '));
+            }
+
+            const rows = data.table.rows;
+            const cols = data.table.cols;
+
+            return rows.map((row) => {
+                const rowData = {};
+                row.c.forEach((cell, index) => {
+                    const originalColLabel = cols[index].label;
+                    const colLabel = sanitizeKey(originalColLabel);
+                    let value = cell ? cell.v : null;
+
+                    if (colLabel === '対象日' && typeof value === 'string' && value.startsWith('Date(')) {
+                        const match = value.match(/Date\((\d+),(\d+),(\d+)\)/);
+                        if (match) {
+                            const [_, year, month, day] = match;
+                            value = `${year}/${String(parseInt(month, 10) + 1).padStart(2, '0')}/${String(day).padStart(2, '0')}`;
+                        }
+                    }
+                    
+                    const isNumericColumn = COMPARISON_KEYS.includes(colLabel) || originalColLabel.includes('人数') || originalColLabel.includes('件数');
+                    rowData[colLabel] = isNumericColumn ? (typeof value === 'number' ? value : 0) : value;
+                });
+                return rowData;
+            }).filter((item) => item['対象日']);
+        }
+
+        async function fetchAllSheetsData() {
+            const allData = {};
+            const promises = SHEET_NAMES.map(sheetName => fetchSheetData(sheetName));
+            const results = await Promise.all(promises);
+            
+            results.forEach((data, index) => {
+                if (data) {
+                    allData[SHEET_NAMES[index]] = data;
+                }
+            });
+
+            return allData;
+        }
+
+        function getComparisonDate(targetDate) {
+            if (!targetDate) return null;
+            const parts = targetDate.split(/[/-]/).map(p => parseInt(p, 10));
+            if (parts.length !== 3) return null;
+            
+            const dateObj = new Date(parts[0], parts[1] - 1, parts[2]);
+            if (isNaN(dateObj.getTime())) return null;
+            
+            dateObj.setFullYear(dateObj.getFullYear() - 1);
+            return `${dateObj.getFullYear()}/${String(dateObj.getMonth() + 1).padStart(2, '0')}/${String(dateObj.getDate()).padStart(2, '0')}`;
+        }
+
+        function getAvailableDates(allData, sortOrder) {
+            const dates = new Set();
+            Object.values(allData).forEach(storeData => {
+                storeData.forEach(item => {
+                    if (item['対象日']) dates.add(item['対象日']);
+                });
+            });
+            
+            const sortedDates = Array.from(dates).sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
+            return sortOrder === 'newest' ? sortedDates.reverse() : sortedDates;
+        }
+
+        function getDataByDate(allData, date) {
+            const result = {};
+            for (const [storeName, storeData] of Object.entries(allData)) {
+                result[storeName] = storeData.find(item => item['対象日'] === date) || null;
+            }
+            return result;
+        }
+
+        function isDateInRange(dateStr, startStr, endStr) {
+            return dateStr >= startStr && dateStr <= endStr;
+        }
+
+        function summarizeDataByPeriod(allData, startDate, endDate) {
+            const summary = {};
+            SHEET_NAMES.forEach(storeName => {
+                summary[storeName] = {};
+                const filteredData = (allData[storeName] || []).filter(item => isDateInRange(item['対象日'], startDate, endDate));
+                
+                SUMMABLE_KEYS.forEach(key => {
+                    summary[storeName][key] = filteredData.reduce((acc, item) => acc + (item[key] || 0), 0);
+                });
+            });
+            return summary;
+        }
+        
+        function calculateComparison(current, previous) {
+            if (previous === undefined || previous === null) return { percentage: 'N/A', type: 'same' };
+            if (previous === 0) {
+                if (current > 0) return { percentage: '+∞%', type: 'increase' };
+                if (current < 0) return { percentage: '-∞%', type: 'decrease' };
+                return { percentage: '0%', type: 'same' };
+            }
+            
+            const percentage = ((current - previous) / previous) * 100;
+            let type = 'same';
+            if (percentage > 0.05) type = 'increase';
+            else if (percentage < -0.05) type = 'decrease';
+            
+            return { percentage: `${percentage > 0 ? '+' : ''}${percentage.toFixed(1)}%`, type };
+        }
+
+        const convertToCsv = (headers, data) => {
+            const csvRows = [headers.join(',')];
+            data.forEach(row => {
+                const values = row.map(value => `"${String(value).replace(/"/g, '""')}"`);
+                csvRows.push(values.join(','));
+            });
+            return csvRows.join('\n');
+        };
+
+        const downloadCsv = (csvString, filename) => {
+            const blob = new Blob(['\uFEFF' + csvString], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        };
+
+        const generateCsvRows = (dataGetter) => {
+            const dataRows = [];
+            SHEET_NAMES.forEach(storeName => {
+                COMPARISON_KEYS.forEach(mainKey => {
+                    const { current, previous } = dataGetter(storeName, mainKey);
+                    const comparison = calculateComparison(current, previous);
+                    const difference = previous !== undefined ? current - previous : 'N/A';
+                    dataRows.push([storeName, mainKey, current, previous ?? 'N/A', comparison.percentage, difference]);
+
+                    (SUB_ITEM_MAP[mainKey] || []).forEach(([label, subKey]) => {
+                        const { current: subCurrent, previous: subPrevious } = dataGetter(storeName, subKey);
+                        const subComparison = calculateComparison(subCurrent, subPrevious);
+                        const subDifference = subPrevious !== undefined ? subCurrent - subPrevious : 'N/A';
+                        dataRows.push([storeName, `  - ${label}`, subCurrent, subPrevious ?? 'N/A', subComparison.percentage, subDifference]);
+                    });
+                });
+            });
+            return dataRows;
+        };
+
+        const handleSingleDayCsvDownload = () => {
+            const { storeData, comparisonData } = getMemoizedData();
+            const headers = ['店舗', 'カテゴリ', `売上 (${state.selectedDate})`, `前年売上 (${getComparisonDate(state.selectedDate) || 'N/A'})`, '前年比', '差額'];
+            const dataGetter = (store, key) => ({
+                current: (storeData[store]?.[key]) || 0,
+                previous: (comparisonData[store]?.[key])
+            });
+            const csvRows = generateCsvRows(dataGetter);
+            const csvString = convertToCsv(headers, csvRows);
+            downloadCsv(csvString, `sales_daily_${state.selectedDate.replace(/\//g, '-')}.csv`);
+        };
+
+
+        const handlePeriodSummaryCsvDownload = () => {
+            const start = state.periodStartDate.replace(/-/g, '/');
+            const end = state.periodEndDate.replace(/-/g, '/');
+            const headers = ['店舗', 'カテゴリ', `期間合計 (${start} - ${end})`, '前年同期間合計', '前年比', '差額'];
+            const dataGetter = (store, key) => ({
+                current: state.periodSummary[store]?.[key] || 0,
+                previous: state.comparisonPeriodSummary[store]?.[key]
+            });
+            const csvRows = generateCsvRows(dataGetter);
+            const csvString = convertToCsv(headers, csvRows);
+            downloadCsv(csvString, `sales_period_${state.periodStartDate}_to_${state.periodEndDate}.csv`);
+        };
+
+
+        // --- RENDER FUNCTIONS ---
+        function formatNumber(num) {
+            if (num === null || num === undefined) return '0';
+            return Number(num).toLocaleString('ja-JP', { maximumFractionDigits: 0 });
+        }
+        
+        function renderLoader(message) {
+            return `
+                <div class="min-h-screen flex items-center justify-center">
+                    <div class="text-center">
+                        <div class="loader ease-linear rounded-full border-8 border-t-8 border-gray-200 h-24 w-24 mx-auto mb-4"></div>
+                        <p class="text-xl text-slate-700">${message}</p>
+                    </div>
+                </div>`;
+        }
+        
+        function showAlert(message, type = 'info', duration = 3000) {
+            const alertId = `alert-${Date.now()}`;
+            const colorMap = {
+                info: 'bg-blue-100 text-blue-800 border-blue-400',
+                warning: 'bg-yellow-100 text-yellow-800 border-yellow-400',
+                error: 'bg-red-100 text-red-700 border-red-400'
+            };
+            const iconName = { info: 'info', warning: 'alert-triangle', error: 'alert-circle' };
+
+            const alertEl = document.createElement('div');
+            alertEl.id = alertId;
+            alertEl.className = `p-4 rounded-lg shadow-xl border transition-all duration-300 opacity-0 transform translate-y-4 ${colorMap[type]}`;
+            alertEl.innerHTML = `<i data-lucide="${iconName[type]}" class="w-5 h-5 inline-block align-text-bottom mr-2"></i> ${message}`;
+            
+            alertContainerEl.appendChild(alertEl);
+            lucide.createIcons();
+
+            // Fade in
+            setTimeout(() => {
+                alertEl.classList.remove('opacity-0', 'translate-y-4');
+            }, 10);
+
+            // Fade out and remove
+            setTimeout(() => {
+                alertEl.classList.add('opacity-0', 'translate-y-4');
+                setTimeout(() => alertEl.remove(), 300);
+            }, duration);
+        }
+
+        function renderComparisonBadge({ current, previous, isLarge = false, unit = '¥' }) {
+            if (previous === null || previous === undefined) {
+                return `<span class="text-sm text-slate-500 w-full text-right sm:ml-4 whitespace-nowrap ${isLarge ? 'text-base' : ''}">比較データなし</span>`;
+            }
+            const comparison = calculateComparison(current, previous);
+            const color = { increase: 'text-green-600', decrease: 'text-red-600', same: 'text-slate-500' }[comparison.type];
+            const icon = { increase: 'trending-up', decrease: 'trending-down', same: 'minus' }[comparison.type];
+
+            const prefix = unit === '¥' ? '¥' : '';
+            const suffix = (unit === '人' || unit === '件') ? unit : '';
+            const formattedPrevious = `${prefix}${formatNumber(previous)}${suffix}`;
+
+            return `
+                <div class="flex items-center justify-end w-full sm:ml-4">
+                    <span class="text-slate-500 mr-2 whitespace-nowrap ${isLarge ? 'text-base' : 'text-xs'}">
+                        前年: ${formattedPrevious}
+                    </span>
+                    <i data-lucide="${icon}" class="w-4 h-4 ${color} mr-1 flex-shrink-0 ${isLarge ? 'w-5 h-5' : ''}"></i>
+                    <span class="font-semibold ${color} flex-shrink-0 whitespace-nowrap ${isLarge ? 'text-xl' : 'text-sm'}">
+                        ${comparison.percentage}
+                    </span>
+                </div>`;
+        }
+        
+        function renderSalesCard({ title, data, prevData, dataKey, subKeys = [] }) {
+            const current = data?.[dataKey] || 0;
+            return `
+                <div class="bg-white rounded-lg shadow-md hover:shadow-lg transition-shadow border border-slate-200">
+                    <div class="p-4 border-b bg-slate-50 rounded-t-lg flex flex-wrap justify-between items-center gap-2">
+                        <h3 class="text-lg font-semibold text-slate-700 truncate">${title}</h3>
+                        ${renderComparisonBadge({ current: current, previous: prevData?.[dataKey], unit: "¥" })}
+                    </div>
+                    <div class="p-6">
+                        <p class="text-3xl font-bold text-blue-600 mb-2">¥${formatNumber(current)}</p>
+                        ${subKeys.length > 0 ? `
+                            <div class="space-y-2 pt-2 border-t mt-4">
+                                ${subKeys.map(([label, subKey]) => `
+                                    <div class="flex justify-between items-center">
+                                        <span class="text-slate-600">${label}:</span>
+                                        <span class="text-xl font-semibold text-slate-800">
+                                            ${formatNumber(data?.[subKey] || 0)}${label.includes('人数') ? '人' : '件'}
+                                        </span>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        ` : ''}
+                    </div>
+                </div>`;
+        }
+
+        function renderDailyReport() {
+            const { storeData, comparisonData, comparisonDate } = getMemoizedData();
+            return `
+                <div class="bg-yellow-50 text-yellow-800 p-3 rounded-lg text-sm mb-6 border border-yellow-200 flex items-center gap-2">
+                    <i data-lucide="info" class="w-4 h-4 flex-shrink-0"></i>
+                    <span><strong>単日比較データ</strong>は、選択された日付の<strong>前年同日</strong>の売上を使用しています。</span>
+                </div>
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                    ${SHEET_NAMES.map(storeName => {
+                        const data = storeData[storeName];
+                        const prevData = comparisonData[storeName];
+
+                        if (!data) {
+                            return `
+                                <div class="space-y-6">
+                                    <div class="bg-gradient-to-r from-blue-600 to-blue-700 text-white p-6 rounded-xl shadow-xl">
+                                        <h2 class="text-3xl font-bold text-center">${storeName}</h2>
+                                    </div>
+                                    <div class="bg-white p-6 rounded-xl shadow-xl flex flex-col justify-center items-center min-h-[200px] border border-slate-200">
+                                        <p class="text-slate-500">対象日のデータがありません</p>
+                                    </div>
+                                </div>`;
+                        }
+
+                        return `
+                            <div class="space-y-6">
+                                <div class="bg-gradient-to-r from-blue-600 to-blue-700 text-white p-6 rounded-xl shadow-xl">
+                                    <h2 class="text-3xl font-bold text-center">${storeName}</h2>
+                                    <p class="text-sm text-center mt-1 opacity-90">
+                                        比較対象日: ${comparisonDate || 'なし'}
+                                    </p>
+                                </div>
+                                ${renderSalesCard({ title: "売上日計", data, prevData, dataKey: "売上日計" })}
+                                ${renderSalesCard({ title: "サウナ", data, prevData, dataKey: "サウナ", subKeys: SUB_ITEM_MAP['サウナ'] })}
+                                ${renderSalesCard({ title: "宿泊売上計", data, prevData, dataKey: "宿泊売上計", subKeys: SUB_ITEM_MAP['宿泊売上計'] })}
+                                ${renderSalesCard({ title: "マッサージ", data, prevData, dataKey: "マッサージ", subKeys: SUB_ITEM_MAP['マッサージ'] })}
+                                ${renderSalesCard({ title: "グリル", data, prevData, dataKey: "グリル", subKeys: SUB_ITEM_MAP['グリル'] })}
+                                ${renderSalesCard({ title: "物販", data, prevData, dataKey: "物販" })}
+                            </div>`;
+                    }).join('')}
+                </div>`;
+        }
+        
+        function renderPeriodSummaryContent() {
+            if (state.isSummarizing) {
+                return `
+                    <div class="bg-white p-6 rounded-xl shadow-lg border border-slate-200 text-center">
+                        <div class="loader ease-linear rounded-full border-4 border-t-4 border-gray-200 h-10 w-10 mx-auto mb-3"></div>
+                        <p class="text-lg text-slate-600">期間データを集計中...</p>
+                    </div>`;
+            }
+
+            if (!state.periodSummary) {
+                return `
+                    <div class="bg-white p-6 rounded-xl shadow-lg border border-slate-200">
+                        <h3 class="text-2xl font-bold text-slate-800 mb-2">集計結果</h3>
+                        <p class="text-slate-500">期間を設定し、「集計実行」ボタンを押してください。</p>
+                    </div>`;
+            }
+
+            const categoryMap = [
+                { key: 'サウナ', label: 'サウナ', subItems: [{ key: '人数(S)', label: '人数', unit: '人' }] },
+                { key: '宿泊売上計', label: '宿泊', subItems: [{ key: '人数(C)', label: '人数', unit: '人' }] },
+                { key: 'マッサージ', label: 'マッサージ', subItems: [{ key: '人数(M)', label: '人数', unit: '人' }] },
+                { key: 'グリル', label: 'グリル', subItems: [{ key: '件数(G)', label: '件数', unit: '件' }] },
+                { key: '物販', label: '物販', subItems: [] },
+            ];
+
+            return `
+                <div class="bg-indigo-50 text-indigo-800 p-4 rounded-lg text-base mb-6 border border-indigo-200">
+                    <p><strong>対象期間:</strong> ${state.periodStartDate.replace(/-/g, '/')} 〜 ${state.periodEndDate.replace(/-/g, '/')}</p>
+                    <p><strong>比較期間:</strong> ${getComparisonDate(state.periodStartDate.replace(/-/g, '/'))} 〜 ${getComparisonDate(state.periodEndDate.replace(/-/g, '/'))} (前年同期間)</p>
+                </div>
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                    ${SHEET_NAMES.map(storeName => {
+                        const currentData = state.periodSummary[storeName];
+                        const prevData = state.comparisonPeriodSummary?.[storeName];
+                        const currentTotal = currentData['売上日計'] || 0;
+                        const prevTotal = prevData?.['売上日計'];
+
+                        return `
+                            <div class="bg-white p-6 rounded-xl shadow-lg border-2 border-indigo-100 hover:shadow-xl transition-shadow">
+                                <h3 class="text-2xl font-extrabold text-indigo-700 mb-4 pb-2 border-b">${storeName} - 期間合計</h3>
+                                <div class="mb-4">
+                                    <p class="text-lg font-medium text-slate-600">売上日計 (期間合計)</p>
+                                    <p class="text-4xl font-black text-indigo-600">¥${formatNumber(currentTotal)}</p>
+                                </div>
+                                <div class="mb-6">
+                                    <p class="text-base font-medium text-slate-600">前年同期間比</p>
+                                    ${renderComparisonBadge({ current: currentTotal, previous: prevTotal, isLarge: true, unit: "¥" })}
+                                </div>
+                                <h4 class="text-xl font-semibold text-slate-700 mt-4 pt-4 border-t">カテゴリ別内訳</h4>
+                                <ul class="divide-y divide-slate-100">
+                                    ${categoryMap.map(({ key, label, subItems }) => `
+                                        <li class="py-3 space-y-2">
+                                            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center">
+                                                <div class="mb-2 sm:mb-0">
+                                                    <span class="text-base text-slate-600 font-medium">${label}:</span>
+                                                    <span class="block sm:inline sm:ml-2 text-lg font-bold text-slate-800">¥${formatNumber(currentData[key] || 0)}</span>
+                                                </div>
+                                                <div class="w-full sm:w-auto">
+                                                    ${renderComparisonBadge({ current: currentData[key] || 0, previous: prevData?.[key], unit: "¥" })}
+                                                </div>
+                                            </div>
+                                            ${subItems.map(sub => `
+                                                <div class="flex justify-between items-center pl-4">
+                                                    <span class="text-sm text-slate-500">${sub.label}:</span>
+                                                    <div class="flex flex-col items-end">
+                                                        <span class="text-base font-semibold text-slate-700">${formatNumber(currentData[sub.key] || 0)}${sub.unit}</span>
+                                                        ${renderComparisonBadge({ current: currentData[sub.key] || 0, previous: prevData?.[sub.key], unit: sub.unit })}
+                                                    </div>
+                                                </div>
+                                            `).join('')}
+                                        </li>
+                                    `).join('')}
+                                </ul>
+                            </div>`;
+                    }).join('')}
+                </div>`;
+        }
+
+        function renderPeriodSummary() {
+            return `
+                <section class="mt-12 pt-6 border-t border-slate-300">
+                    <h2 class="text-3xl sm:text-4xl font-extrabold text-slate-800 mb-4 flex items-center gap-2">
+                        <i data-lucide="clock" class="w-8 h-8 text-indigo-600"></i> 期間集計
+                    </h2>
+                    <div class="flex flex-col lg:flex-row items-center gap-4 bg-white p-6 rounded-xl shadow-lg border border-slate-200">
+                        <div class="flex items-center gap-2 w-full lg:w-auto">
+                            <label for="start-date" class="text-slate-700 font-medium whitespace-nowrap">開始日:</label>
+                            <input type="date" id="start-date" value="${state.periodStartDate}" class="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                        </div>
+                        <span class="text-xl text-slate-500 hidden lg:block">〜</span>
+                        <div class="flex items-center gap-2 w-full lg:w-auto">
+                            <label for="end-date" class="text-slate-700 font-medium whitespace-nowrap">終了日:</label>
+                            <input type="date" id="end-date" value="${state.periodEndDate}" class="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                        </div>
+                        <div class="w-full lg:w-auto lg:ml-auto flex flex-col lg:flex-row gap-2 mt-2 lg:mt-0">
+                             <button id="csv-period-btn" ${!state.periodSummary ? 'disabled' : ''} class="bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition-colors flex items-center justify-center gap-2 font-semibold shadow-md disabled:opacity-50 disabled:cursor-not-allowed">
+                                <i data-lucide="download" class="w-4 h-4"></i>CSV (期間)
+                            </button>
+                            <button id="summarize-btn" ${state.isSummarizing ? 'disabled' : ''} class="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 transition-colors flex items-center justify-center gap-2 font-semibold shadow-md disabled:opacity-50 disabled:cursor-not-allowed">
+                                <i data-lucide="calculator" class="w-4 h-4"></i>集計実行
+                            </button>
+                        </div>
+                    </div>
+                    <div id="period-summary-content" class="mt-8">
+                        ${renderPeriodSummaryContent()}
+                    </div>
+                </section>`;
+        }
+        
+        function renderPasswordProtect(error = '') {
+            return `
+                <div class="flex items-center justify-center min-h-screen bg-slate-100">
+                    <div class="w-full max-w-md p-8 space-y-6 bg-white rounded-xl shadow-lg">
+                        <div class="text-center">
+                            <h1 class="text-2xl font-bold text-slate-800">認証が必要です</h1>
+                            <p class="mt-2 text-slate-500">ダッシュボードにアクセスするにはパスワードを入力してください。</p>
+                        </div>
+                        <form id="password-form" class="space-y-6">
+                            <div class="relative">
+                                <input id="password" name="password" type="password" class="peer h-10 w-full border-b-2 border-slate-300 text-slate-900 placeholder-transparent focus:outline-none focus:border-blue-600" placeholder="password" autofocus />
+                                <label for="password" class="absolute left-0 -top-3.5 text-slate-600 text-sm transition-all peer-placeholder-shown:text-base peer-placeholder-shown:text-slate-400 peer-placeholder-shown:top-2 peer-focus:-top-3.5 peer-focus:text-slate-600 peer-focus:text-sm">パスワード</label>
+                            </div>
+                            ${error ? `<p class="text-sm text-red-500 text-center">${error}</p>` : ''}
+                            <button type="submit" class="w-full px-4 py-2 text-white font-semibold bg-blue-600 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors">アクセス</button>
+                        </form>
+                    </div>
+                </div>`;
+        }
+
+        function renderErrorState() {
+             return `
+                <div class="min-h-screen flex items-center justify-center p-4">
+                    <div class="text-center max-w-md">
+                        <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4" role="alert">
+                            <strong class="font-bold">エラーが発生しました</strong>
+                            <span class="block sm:inline">${state.error}</span>
+                        </div>
+                        <button id="reload-btn" class="mt-4 bg-blue-600 text-white font-bold py-2 px-4 rounded hover:bg-blue-700 transition-colors">
+                            再読み込み
+                        </button>
+                    </div>
+                </div>`;
+        }
+        
+        function renderDashboard() {
+            return `
+                <div class="min-h-screen p-4 sm:p-8">
+                    <div class="max-w-7xl mx-auto">
+                        <header class="mb-8">
+                            <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-800 mb-6 border-b pb-2">店舗別 売上比較ダッシュボード</h1>
+                            <div class="flex flex-col sm:flex-row sm:flex-wrap items-start sm:items-center gap-4 bg-white p-4 rounded-xl shadow-lg border border-slate-200">
+                                <div class="flex items-center gap-2 w-full sm:w-auto">
+                                    <i data-lucide="calendar" class="text-blue-600 w-5 h-5 flex-shrink-0"></i>
+                                    <label for="date-select" class="text-slate-700 font-medium whitespace-nowrap">対象日:</label>
+                                    <select id="date-select" class="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                        ${state.availableDates.map(date => `<option value="${date}" ${state.selectedDate === date ? 'selected' : ''}>${date}</option>`).join('')}
+                                    </select>
+                                </div>
+                                <div class="flex items-center gap-2 w-full sm:w-auto sm:ml-6">
+                                    <i data-lucide="arrow-down-up" class="text-blue-600 w-5 h-5 flex-shrink-0"></i>
+                                    <label for="sort-select" class="text-slate-700 font-medium whitespace-nowrap">期間ソート:</label>
+                                    <select id="sort-select" class="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                        <option value="newest" ${state.sortOrder === 'newest' ? 'selected' : ''}>新しい順</option>
+                                        <option value="oldest" ${state.sortOrder === 'oldest' ? 'selected' : ''}>古い順</option>
+                                    </select>
+                                </div>
+                                <div class="w-full sm:w-auto sm:ml-auto flex flex-col sm:flex-row gap-2 mt-2 sm:mt-0">
+                                    <button id="csv-daily-btn" class="bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition-colors flex items-center justify-center gap-2 font-semibold shadow-md">
+                                        <i data-lucide="download" class="w-4 h-4"></i>CSV (単日)
+                                    </button>
+                                    <button id="reload-btn" class="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors flex items-center justify-center gap-2 font-semibold shadow-md">
+                                        <i data-lucide="refresh-cw" class="w-4 h-4"></i>データ更新
+                                    </button>
+                                </div>
+                            </div>
+                        </header>
+                        <main>
+                            ${renderDailyReport()}
+                            ${renderPeriodSummary()}
+                        </main>
+                    </div>
+                </div>`;
+        }
+
+        // --- EVENT HANDLERS & APP LOGIC ---
+        
+        let memoizedData = {};
+        function getMemoizedData() {
+            if (memoizedData.selectedDate === state.selectedDate && memoizedData.allData === state.allData) {
+                return memoizedData;
+            }
+            if (!state.selectedDate || Object.keys(state.allData).length === 0) {
+                return { storeData: {}, comparisonDate: null, comparisonData: {} };
+            }
+            const currentStoreData = getDataByDate(state.allData, state.selectedDate);
+            const compDate = getComparisonDate(state.selectedDate);
+            const compData = compDate ? getDataByDate(state.allData, compDate) : {};
+            
+            memoizedData = {
+                storeData: currentStoreData,
+                comparisonDate: compDate,
+                comparisonData: compData,
+                selectedDate: state.selectedDate,
+                allData: state.allData,
+            };
+            return memoizedData;
+        }
+
+        function handlePasswordSubmit(e) {
+            e.preventDefault();
+            const password = e.target.elements.password.value;
+            if (password === ACCESS_PASSWORD) {
+                sessionStorage.setItem('dashboard_authenticated', 'true');
+                state.isAuthenticated = true;
+                loadData();
+            } else {
+                rootEl.innerHTML = renderPasswordProtect('アクセスが拒否されました。パスワードが正しくありません。');
+                attachEventListeners();
+            }
+        }
+
+        function handleDateChange(e) {
+            state.selectedDate = e.target.value;
+            renderApp();
+        }
+
+        function handleSortChange(e) {
+            state.sortOrder = e.target.value;
+            loadData();
+        }
+
+        function handleSummarize() {
+            if (new Date(state.periodStartDate) > new Date(state.periodEndDate)) {
+                showAlert('開始日が終了日より後になっています。', 'warning');
+                return;
+            }
+            state.isSummarizing = true;
+            renderApp();
+
+            setTimeout(() => {
+                const start = state.periodStartDate.replace(/-/g, '/');
+                const end = state.periodEndDate.replace(/-/g, '/');
+                state.periodSummary = summarizeDataByPeriod(state.allData, start, end);
+                state.comparisonPeriodSummary = summarizeDataByPeriod(state.allData, getComparisonDate(start), getComparisonDate(end));
+                state.isSummarizing = false;
+                showAlert(`期間集計を完了しました (${start}〜${end})`);
+                renderApp();
+            }, 500);
+        }
+
+        async function loadData() {
+            state.loading = true;
+            state.error = null;
+            state.periodSummary = null;
+            renderApp();
+
+            try {
+                const data = await fetchAllSheetsData();
+                state.allData = data;
+                const dates = getAvailableDates(data, state.sortOrder);
+                state.availableDates = dates;
+                if (dates.length > 0) {
+                    state.selectedDate = dates[0];
+                } else {
+                    state.error = "利用可能なデータがありません。";
+                }
+            } catch (err) {
+                state.error = err.message || 'データの読み込みに失敗しました。スプレッドシートが公開されているか確認してください。';
+            } finally {
+                state.loading = false;
+                renderApp();
+            }
+        }
+        
+        function attachEventListeners() {
+            const passwordForm = document.getElementById('password-form');
+            if (passwordForm) passwordForm.addEventListener('submit', handlePasswordSubmit);
+            
+            const dateSelect = document.getElementById('date-select');
+            if (dateSelect) dateSelect.addEventListener('change', handleDateChange);
+
+            const sortSelect = document.getElementById('sort-select');
+            if (sortSelect) sortSelect.addEventListener('change', handleSortChange);
+
+            const reloadBtn = document.getElementById('reload-btn');
+            if (reloadBtn) reloadBtn.addEventListener('click', loadData);
+
+            const csvDailyBtn = document.getElementById('csv-daily-btn');
+            if(csvDailyBtn) csvDailyBtn.addEventListener('click', handleSingleDayCsvDownload);
+
+            const csvPeriodBtn = document.getElementById('csv-period-btn');
+            if(csvPeriodBtn) csvPeriodBtn.addEventListener('click', handlePeriodSummaryCsvDownload);
+            
+            const startDateInput = document.getElementById('start-date');
+            if(startDateInput) startDateInput.addEventListener('change', e => { state.periodStartDate = e.target.value; });
+            
+            const endDateInput = document.getElementById('end-date');
+            if(endDateInput) endDateInput.addEventListener('change', e => { state.periodEndDate = e.target.value; });
+
+            const summarizeBtn = document.getElementById('summarize-btn');
+            if(summarizeBtn) summarizeBtn.addEventListener('click', handleSummarize);
+        }
+
+        function renderApp() {
+            if (state.loading) {
+                rootEl.innerHTML = renderLoader('データを読み込んでいます...');
+            } else if (state.error) {
+                rootEl.innerHTML = renderErrorState();
+            } else if (!state.isAuthenticated) {
+                rootEl.innerHTML = renderPasswordProtect();
+            } else {
+                rootEl.innerHTML = renderDashboard();
+            }
+            lucide.createIcons();
+            attachEventListeners();
+        }
+
+        function init() {
+            const sessionAuth = sessionStorage.getItem('dashboard_authenticated');
+            if (sessionAuth === 'true') {
+                state.isAuthenticated = true;
+                loadData();
+            } else {
+                state.isAuthenticated = false;
+                state.loading = false;
+                renderApp();
+            }
+        }
+
+        // --- INITIALIZATION ---
+        init();
+    </script>
 </body>
 </html>
