@@ -1,0 +1,5 @@
+{
+  "name": "Sales Comparison Dashboard",
+  "description": "A dashboard to display and compare daily and periodic sales data for multiple stores, fetched from a Google Sheet. It allows comparison with the previous year's data and provides CSV export functionality.",
+  "requestFramePermissions": []
+}
